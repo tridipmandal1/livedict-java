@@ -3,15 +3,22 @@ package com.livedict.core;
 
 import java.util.concurrent.TimeUnit;
 
+@SuppressWarnings("All")
 public final class LiveDictConfig {
 
     private final long defaultTtlMillis;
 
     private final long cleanupIntervalMillis;
 
+    private final boolean asyncListeners;
+
+    private final int listenerThreads;
+
     private LiveDictConfig(Builder builder) {
         this.defaultTtlMillis = builder.defaultTtlMillis;
         this.cleanupIntervalMillis = builder.cleanupIntervalMillis;
+        this.asyncListeners = builder.asyncListeners;
+        this.listenerThreads = builder.listenerThreads;
     }
 
     public long getDefaultTtlMillis() {
@@ -20,6 +27,14 @@ public final class LiveDictConfig {
 
     public long getCleanupIntervalMillis() {
         return cleanupIntervalMillis;
+    }
+
+    public boolean isAsyncListeners() {
+        return asyncListeners;
+    }
+
+    public int getListenerThreads() {
+        return listenerThreads;
     }
 
     public static Builder builder(){
@@ -34,6 +49,8 @@ public final class LiveDictConfig {
 
         private long defaultTtlMillis = -1;
         private long cleanupIntervalMillis = 60_000;
+        private boolean asyncListeners = false;
+        private int listenerThreads = 2;
 
         private Builder(){}
 
@@ -46,6 +63,17 @@ public final class LiveDictConfig {
         public Builder cleanupInterval(long amount, TimeUnit unit) {
             if (amount <= 0) throw new IllegalArgumentException("Cleanup time interval must be positive");
             this.cleanupIntervalMillis = unit.toMillis(amount);
+            return this;
+        }
+
+        public Builder asyncListeners(boolean enabled) {
+            this.asyncListeners = enabled;
+            return this;
+        }
+
+        public Builder listenerThreads(int threads) {
+            if (threads < 1) throw new IllegalArgumentException("Listener threads must be >1");
+            this.listenerThreads = threads;
             return this;
         }
 

@@ -6,9 +6,7 @@ import com.livedict.reactivity.LiveDictEvent;
 import com.livedict.reactivity.LiveDictListener;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -25,6 +23,8 @@ public class LiveDict<K, V> implements AutoCloseable{
 
     private final ExpiryScheduler<K,V> expiryScheduler;
 
+    private final ExecutorService listenerExecutor;
+
     public LiveDict (){
         this(LiveDictConfig.defaults());
     }
@@ -36,6 +36,20 @@ public class LiveDict<K, V> implements AutoCloseable{
 
         for(EventType type: EventType.values()) {
             listeners.put(type, new CopyOnWriteArrayList<>());
+        }
+
+        if (config.isAsyncListeners()) {
+            this.listenerExecutor = Executors.newFixedThreadPool(
+                    config.getListenerThreads(),
+                    runnable -> {
+                        Thread thread = new Thread(runnable, "livedict-listener");
+                        thread.setDaemon(true);
+                        return thread;
+                    }
+            );
+
+        } else {
+            this.listenerExecutor = null;
         }
 
         this.expiryScheduler = new ExpiryScheduler<>(store, this::fireExpireEvent);
@@ -126,13 +140,27 @@ public class LiveDict<K, V> implements AutoCloseable{
         if(listenersForType.isEmpty()) return;
 
         LiveDictEvent<K, V> event = new LiveDictEvent<>(type, key, value);
+
+        if (listenerExecutor != null) {
+            listenerExecutor.submit(() -> invokeListeners(listenersForType, event, type, key));
+        }
+         else {
+             invokeListeners(listenersForType, event, type, key);
+        }
+
+    }
+
+    private void invokeListeners(List<LiveDictListener<K, V>> listenersForType,
+                                 LiveDictEvent<K, V> event,
+                                 EventType type,
+                                 K key) {
         for (LiveDictListener<K, V> listener: listenersForType) {
             try {
                 listener.onEvent(event);
             } catch (Throwable t) {
                 LOGGER.log(Level.WARNING,
-                    "LiveDict listener threw Throwable for event " +
-                            type + " on key " + key, t
+                        "LiveDict listener threw Throwable for event " +
+                                type + " on key " + key, t
                 );
             }
         }
@@ -146,6 +174,20 @@ public class LiveDict<K, V> implements AutoCloseable{
     @Override
     public void close() {
         expiryScheduler.stop();
+
+        if (listenerExecutor != null) {
+            listenerExecutor.shutdown();
+
+            try {
+                if (!listenerExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    LOGGER.warning("Listener executor didn't terminate within 5s - forcing shutdown");
+                    listenerExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                listenerExecutor.shutdownNow();
+            }
+        }
     }
 
     @Override
