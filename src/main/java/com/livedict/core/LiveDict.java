@@ -7,6 +7,7 @@ import com.livedict.reactivity.LiveDictListener;
 
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -25,6 +26,8 @@ public class LiveDict<K, V> implements AutoCloseable{
 
     private final ExecutorService listenerExecutor;
 
+    private final ConcurrentHashMap<K, ReentrantLock> keyLocks;
+
     public LiveDict (){
         this(LiveDictConfig.defaults());
     }
@@ -33,6 +36,7 @@ public class LiveDict<K, V> implements AutoCloseable{
         this.config = config;
         this.store = new ConcurrentHashMap<>();
         this.listeners = new ConcurrentHashMap<>();
+        this.keyLocks = new ConcurrentHashMap<>();
 
         for(EventType type: EventType.values()) {
             listeners.put(type, new CopyOnWriteArrayList<>());
@@ -168,6 +172,41 @@ public class LiveDict<K, V> implements AutoCloseable{
 
     private void fireExpireEvent(K key, V value){
         fireEvent(EventType.ON_EXPIRE, key, value);
+    }
+
+    public void lock(K key) throws InterruptedException{
+        if (key == null) throw new NullPointerException("Lock key must not be null");
+        getLockForKey(key).lockInterruptibly();
+    }
+
+    public boolean lock(K key, long timeout, TimeUnit unit) throws InterruptedException{
+        if (key == null) throw new NullPointerException("Key must not be null");
+        return getLockForKey(key).tryLock(timeout, unit);
+    }
+
+    public boolean tryLock(K key) {
+        if (key == null) throw new NullPointerException("Key must not be null");
+        return getLockForKey(key).tryLock();
+    }
+
+    public void unlock(K key) {
+        if (key == null) throw new NullPointerException("Key must not be null");
+        ReentrantLock lock = keyLocks.get(key);
+        if (lock == null) throw new IllegalMonitorStateException(
+                "Attempt to unlock key: " + key + " which has never been locked"
+        );
+
+        lock.unlock();
+    }
+
+    public boolean isLocked(K key) {
+        if (key == null) throw new NullPointerException("Key must not be null");
+        ReentrantLock lock = keyLocks.get(key);
+        return lock != null && lock.isLocked();
+    }
+
+    private ReentrantLock getLockForKey(K key) {
+        return keyLocks.computeIfAbsent(key, k -> new ReentrantLock());
     }
 
 
