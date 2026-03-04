@@ -1,6 +1,9 @@
 package com.livedict.core;
 
 
+import com.livedict.backend.Backend;
+import com.livedict.backend.MemoryBackend;
+
 import java.util.concurrent.TimeUnit;
 
 @SuppressWarnings("All")
@@ -14,11 +17,14 @@ public final class LiveDictConfig {
 
     private final int listenerThreads;
 
+    private final Backend<?, ?> backend;
+
     private LiveDictConfig(Builder builder) {
         this.defaultTtlMillis = builder.defaultTtlMillis;
         this.cleanupIntervalMillis = builder.cleanupIntervalMillis;
         this.asyncListeners = builder.asyncListeners;
         this.listenerThreads = builder.listenerThreads;
+        this.backend = builder.backend;
     }
 
     public long getDefaultTtlMillis() {
@@ -37,6 +43,11 @@ public final class LiveDictConfig {
         return listenerThreads;
     }
 
+    @SuppressWarnings("unchecked")
+    public <K, V> Backend<K, V> getBackend() {
+        return (Backend<K, V>) backend;
+    }
+
     public static Builder builder(){
         return new Builder();
     }
@@ -51,6 +62,7 @@ public final class LiveDictConfig {
         private long cleanupIntervalMillis = 60_000;
         private boolean asyncListeners = false;
         private int listenerThreads = 2;
+        private Backend<?, ?> backend = null;
 
         private Builder(){}
 
@@ -77,7 +89,15 @@ public final class LiveDictConfig {
             return this;
         }
 
+        public Builder backend(Backend<?, ?> backend) {
+            this.backend = backend;
+            return this;
+        }
+
         public LiveDictConfig build() {
+            if (backend == null) {
+                backend = new MemoryBackend<>();
+            }
             return new LiveDictConfig(this);
         }
     }
