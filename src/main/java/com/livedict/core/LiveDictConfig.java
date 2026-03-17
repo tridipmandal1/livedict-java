@@ -3,6 +3,7 @@ package com.livedict.core;
 
 import com.livedict.backend.Backend;
 import com.livedict.backend.MemoryBackend;
+import com.livedict.backend.PersistenceMode;
 
 import java.util.concurrent.TimeUnit;
 
@@ -19,12 +20,24 @@ public final class LiveDictConfig {
 
     private final Backend<?, ?> backend;
 
+    private final PersistenceMode persistenceMode;
+
+    private final int writeBehindBatchSize;
+
+    private final long writeBehindFlushIntervalMillis;
+
+    private final int writeBehindQueueSize;
+
     private LiveDictConfig(Builder builder) {
         this.defaultTtlMillis = builder.defaultTtlMillis;
         this.cleanupIntervalMillis = builder.cleanupIntervalMillis;
         this.asyncListeners = builder.asyncListeners;
         this.listenerThreads = builder.listenerThreads;
         this.backend = builder.backend;
+        this.persistenceMode = builder.persistenceMode;
+        this.writeBehindBatchSize = builder.writeBehindBatchSize;
+        this.writeBehindFlushIntervalMillis = builder.writeBehindFlushIntervalMillis;
+        this.writeBehindQueueSize = builder.writeBehindQueueSize;
     }
 
     public long getDefaultTtlMillis() {
@@ -41,6 +54,22 @@ public final class LiveDictConfig {
 
     public int getListenerThreads() {
         return listenerThreads;
+    }
+
+    public PersistenceMode getPersistenceMode() {
+        return persistenceMode;
+    }
+
+    public int getWriteBehindBatchSize() {
+        return writeBehindBatchSize;
+    }
+
+    public long getWriteBehindFlushIntervalMillis() {
+        return writeBehindFlushIntervalMillis;
+    }
+
+    public int getWriteBehindQueueSize() {
+        return writeBehindQueueSize;
     }
 
     @SuppressWarnings("unchecked")
@@ -63,6 +92,10 @@ public final class LiveDictConfig {
         private boolean asyncListeners = false;
         private int listenerThreads = 2;
         private Backend<?, ?> backend = null;
+        private PersistenceMode persistenceMode = PersistenceMode.WRITE_THROUGH;
+        private int writeBehindBatchSize = 100;
+        private long writeBehindFlushIntervalMillis = 100;
+        private int writeBehindQueueSize = 10_000;
 
         private Builder(){}
 
@@ -91,6 +124,29 @@ public final class LiveDictConfig {
 
         public Builder backend(Backend<?, ?> backend) {
             this.backend = backend;
+            return this;
+        }
+
+        public Builder persistenceMode(PersistenceMode persistenceMode) {
+            this.persistenceMode = persistenceMode;
+            return this;
+        }
+
+        public Builder writeBehindBatchSize(int batchSize) {
+            if (batchSize < 1) throw new IllegalArgumentException("Write-behind batch size must be more than one");
+            this.writeBehindBatchSize = batchSize;
+            return this;
+        }
+
+        public Builder writeBehindFlushInterval(long interval, TimeUnit unit) {
+            if (interval <= 0) throw new IllegalArgumentException("Write-behind flush interval must be positive");
+            this.writeBehindFlushIntervalMillis = unit.toMillis(interval);
+            return this;
+        }
+
+        public Builder writeBehindQueueSize(int queueSize) {
+            if (queueSize < 1) throw new IllegalArgumentException("Write-behind queue size must be more than one");
+            this.writeBehindQueueSize = queueSize;
             return this;
         }
 

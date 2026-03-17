@@ -2,21 +2,25 @@ package com.livedict.core;
 
 import com.livedict.backend.Backend;
 import com.livedict.backend.BackendException;
+import com.livedict.backend.PersistenceMode;
 import com.livedict.expiry.ExpiryScheduler;
 import com.livedict.reactivity.EventType;
 import com.livedict.reactivity.LiveDictEvent;
 import com.livedict.reactivity.LiveDictListener;
+import com.livedict.writebehind.WriteBehindExecutor;
+import com.livedict.writebehind.WriteOperation;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+
 
 public class LiveDict<K, V> implements AutoCloseable{
 
     private static final Logger LOGGER =
-            Logger.getLogger(LiveDict.class.getName());
+            LoggerFactory.getLogger(LiveDict.class);
 
     private final ConcurrentHashMap<K, LiveDictEntry<V>> store;
 
@@ -31,6 +35,8 @@ public class LiveDict<K, V> implements AutoCloseable{
     private final ConcurrentHashMap<K, ReentrantLock> keyLocks;
 
     private final Backend<K, V> backend;
+
+    private final WriteBehindExecutor<K, V> writeBehindExecutor;
 
     public LiveDict (){
         this(LiveDictConfig.defaults());
@@ -66,14 +72,29 @@ public class LiveDict<K, V> implements AutoCloseable{
         try {
             Map<K, V> existing = backend.loadAll();
             if (!existing.isEmpty()) {
-                // TODO Backend not returning ttl information
+                // TODO: Backend not returning ttl information
                 for (Map.Entry<K, V> entry : existing.entrySet()) {
                     store.put(entry.getKey(), new LiveDictEntry<>(entry.getValue(), -1));
                 }
-                LOGGER.info("Loaded " + existing.size() + " entries from backend");
+                LOGGER.info("Loaded {} entries from backend", existing.size());
             }
         } catch (BackendException e) {
-            LOGGER.log(Level.SEVERE, "Failed to load existing entries from backend - starting with empty cache", e);
+            LOGGER.error("Failed to load existing entries from backend - starting with empty cache", e);
+        }
+
+        if (config.getPersistenceMode() == PersistenceMode.WRITE_BEHIND) {
+            this.writeBehindExecutor =
+                    new WriteBehindExecutor<>(
+                            backend,
+                            config.getWriteBehindQueueSize(),
+                            config.getWriteBehindBatchSize(),
+                            config.getWriteBehindFlushIntervalMillis()
+                    );
+            this.writeBehindExecutor.start();
+            LOGGER.info("Write-behind mode enabled");
+        } else {
+            this.writeBehindExecutor = null;
+            LOGGER.info("Write-through mode enabled");
         }
 
         this.expiryScheduler = new ExpiryScheduler<>(store, this::handleExpiredEntry);
@@ -95,18 +116,32 @@ public class LiveDict<K, V> implements AutoCloseable{
         if (key == null) throw new NullPointerException("LiveDict key must not be null");
         LiveDictEntry<V> entry = new LiveDictEntry<>(value, ttlMillis);
 
-        // Write to backend FIRST (write-through mode)
-        try {
-            long expiresAt = (ttlMillis > 0)
-                    ? System.currentTimeMillis() + ttlMillis
-                    : -1;
-            backend.put(key, value, expiresAt);
-        } catch (BackendException e) {
-            LOGGER.log(Level.SEVERE, "Backend write failed for key: " + key, e);
-            // Fail fast — if the backend is configured, we want durability
-            throw new RuntimeException("Backend persistence failed", e);
+        long expiresAt = (ttlMillis > 0)
+                ? System.currentTimeMillis() + ttlMillis
+                : -1;
+
+        if (writeBehindExecutor != null) {
+            store.put(key, entry);
+            boolean enqueued = writeBehindExecutor.enqueue(
+                    new WriteOperation.Put<>(key, value, expiresAt)
+            );
+            if (!enqueued) {
+                // memory updated but backend write rejected
+                // Reject&Log strategy
+                LOGGER.warn("Write-behind queue full — write may be lost for key: {}", key);
+            }
+        } else {
+            store.put(key, entry);
+            try {
+                backend.put(key, value, expiresAt);
+            } catch (BackendException e) {
+                store.remove(key, entry); // rollback
+                LOGGER.error("Backend write failed for key: {}", key, e);
+
+                throw new RuntimeException("Backend persistence failed", e);
+            }
+
         }
-        store.put(key, entry);
         fireEvent(EventType.ON_SET, key, value);
     }
 
@@ -133,16 +168,23 @@ public class LiveDict<K, V> implements AutoCloseable{
     public boolean delete(K key) {
         if (key == null) return false;
 
-        LiveDictEntry<V> removed = store.remove(key);
+        LiveDictEntry<V> removed = store.get(key);
         if (removed != null) {
-            // Delete from backend
-            try {
-                backend.delete(key);
-            } catch (BackendException e) {
-                LOGGER.log(Level.WARNING, "Backend delete failed for key: " + key, e);
-                // Non-fatal — memory delete succeeded, backend is best-effort
-            }
 
+            if (writeBehindExecutor != null) {
+                store.remove(key);
+                writeBehindExecutor.enqueue(
+                        new WriteOperation.Delete<>(key)
+                );
+            } else {
+                try {
+                    backend.delete(key);
+                    store.remove(key);
+                } catch (BackendException e) {
+                    LOGGER.trace("Backend delete failed for key: {}", key, e);
+                    return false;
+                }
+            }
             fireEvent(EventType.ON_DELETE, key, removed.getValue());
             return true;
         }
@@ -159,10 +201,17 @@ public class LiveDict<K, V> implements AutoCloseable{
 
     public void clear() {
         store.clear();
-        try {
-            backend.clear();
-        } catch (BackendException e) {
-            LOGGER.log(Level.SEVERE, "Failed to clear backend", e);
+
+        if (writeBehindExecutor != null) {
+            writeBehindExecutor.enqueue(
+                    new WriteOperation.Clear<>()
+            );
+        } else {
+            try {
+                backend.clear();
+            } catch (BackendException e) {
+                LOGGER.warn("Backend clear failed", e);
+            }
         }
     }
 
@@ -210,10 +259,8 @@ public class LiveDict<K, V> implements AutoCloseable{
             try {
                 listener.onEvent(event);
             } catch (Throwable t) {
-                LOGGER.log(Level.WARNING,
-                        "LiveDict listener threw Throwable for event " +
-                                type + " on key " + key, t
-                );
+                LOGGER.warn("LiveDict listener threw Throwable for event {} on key {}",
+                        type, key, t);
             }
         }
     }
@@ -224,10 +271,16 @@ public class LiveDict<K, V> implements AutoCloseable{
 
     private void handleExpiredEntry(K key, V value) {
 
-        try {
-            backend.delete(key);
-        } catch (BackendException e) {
-            LOGGER.log(Level.WARNING, "Backend delete failed during scheduled expiry for key: " + key, e);
+        if (writeBehindExecutor != null) {
+            writeBehindExecutor.enqueue(
+                    new WriteOperation.Delete<>(key)
+            );
+        }else {
+            try {
+                backend.delete(key);
+            } catch (BackendException e) {
+                LOGGER.warn("Backend delete failed during scheduled expiry for key: {}", key, e);
+            }
         }
         fireEvent(EventType.ON_EXPIRE, key, value);
     }
@@ -237,10 +290,16 @@ public class LiveDict<K, V> implements AutoCloseable{
         boolean removed = store.remove(key, entry);
 
         if (removed) {
-            try {
-                backend.delete(key);
-            } catch (BackendException e) {
-                LOGGER.log(Level.WARNING, "Backend delete failed during expiry for key: " + key, e);
+            if (writeBehindExecutor != null) {
+                writeBehindExecutor.enqueue(
+                        new WriteOperation.Delete<>(key)
+                );
+            } else {
+                try {
+                    backend.delete(key);
+                } catch (BackendException e) {
+                    LOGGER.warn("Backend delete failed during expiry for key: {}", key, e);
+                }
             }
         }
         fireEvent(eventType, key, entry.getValue());
@@ -294,7 +353,7 @@ public class LiveDict<K, V> implements AutoCloseable{
 
             try {
                 if (!listenerExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
-                    LOGGER.warning("Listener executor didn't terminate within 5s - forcing shutdown");
+                    LOGGER.trace("Listener executor didn't terminate within 5s - forcing shutdown");
                     listenerExecutor.shutdownNow();
                 }
             } catch (InterruptedException e) {
@@ -303,10 +362,13 @@ public class LiveDict<K, V> implements AutoCloseable{
             }
         }
 
+        if (writeBehindExecutor != null) {
+            writeBehindExecutor.stop(5_000);
+        }
         try {
             backend.close();
         } catch (BackendException e) {
-            LOGGER.log(Level.SEVERE, "Failed to close backend", e);
+            LOGGER.error("Failed to close backend", e);
         }
     }
 

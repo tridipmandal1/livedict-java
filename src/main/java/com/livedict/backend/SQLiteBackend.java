@@ -1,17 +1,24 @@
 package com.livedict.backend;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.*;
 import java.sql.*;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 
+/**
+ *
+ * @param <K> type of keys
+ * @param <V> type of values
+ */
 public class SQLiteBackend<K, V> implements Backend<K, V>{
 
-    private static final Logger LOGGER = Logger.getLogger(SQLiteBackend.class.getName());
+    private static final Logger LOGGER = LoggerFactory.getLogger(SQLiteBackend.class);
 
     private final String dbPath;
     private final Connection connection;
@@ -22,6 +29,16 @@ public class SQLiteBackend<K, V> implements Backend<K, V>{
     private final PreparedStatement deleteStmt;
     private final PreparedStatement clearStmt;
 
+
+    /**
+     * Creates an SQLite backend at the given file path.
+     *
+     * <p>If the database file does not exist, it is created. If it exists,
+     * the schema is validated (and created if missing).
+     *
+     * @param dbPath path to the SQLite database file (e.g., "/tmp/livedict.db")
+     * @throws BackendException if the database cannot be initialized
+     */
     public SQLiteBackend(String dbPath) {
         this.dbPath = dbPath;
 
@@ -32,6 +49,7 @@ public class SQLiteBackend<K, V> implements Backend<K, V>{
 
             initSchema();
 
+            // Reusable prepared statements
             this.putStmt = connection.prepareStatement(
                     "INSERT OR REPLACE INTO livedict_entries " +
                             "(key_hash, key_bytes, value_bytes, expires_at, created_at) " +
@@ -48,7 +66,7 @@ public class SQLiteBackend<K, V> implements Backend<K, V>{
             );
 
             startCleanupTask();
-            LOGGER.info("SqliteBackend initialized at: " + dbPath);
+            LOGGER.info("SqliteBackend initialized at: {}", dbPath);
         } catch (SQLException e) {
             throw new BackendException("Failed to initialize SQLite backend", e);
         }
@@ -197,12 +215,90 @@ public class SQLiteBackend<K, V> implements Backend<K, V>{
             if (deleteStmt != null) deleteStmt.close();
             if (clearStmt != null) clearStmt.close();
             if (connection != null) connection.close();
-            LOGGER.info("SqliteBackend closed: " + dbPath);
+            LOGGER.info("SqliteBackend closed: {}", dbPath);
         } catch (SQLException e) {
             throw new BackendException("Failed to close SQLite backend", e);
         }
     }
 
+    @Override
+    public void putBatch(List<PutEntry<K, V>> entries) throws BackendException {
+        if (entries == null || entries.isEmpty()){
+            return;
+        }
+
+        lock.writeLock().lock();
+
+        try {
+            // starting of atomic operation
+
+            connection.setAutoCommit(false);
+            for (PutEntry<K, V> entry : entries) {
+                String keyHash = keyToHash(entry.key());
+                byte[] keyBytes = serialize(entry.key());
+                byte[] valueBytes = serialize(entry.value());
+                long now = System.currentTimeMillis();
+
+                putStmt.setString(1, keyHash);
+                putStmt.setBytes(2, keyBytes);
+                putStmt.setBytes(3, valueBytes);
+                putStmt.setLong(4, entry.expiresAt());
+                putStmt.setLong(5, now);
+                putStmt.addBatch();
+            }
+
+            putStmt.executeBatch();
+            connection.commit();
+            connection.setAutoCommit(true);
+
+            LOGGER.info("Batch inserted {} entries", entries.size());
+        } catch (SQLException | IOException e) {
+            try {
+                connection.rollback();
+                connection.setAutoCommit(true);
+            } catch (SQLException rollbackEx) {
+                LOGGER.warn( "Failed to rollback batch insert", rollbackEx);
+            }
+            throw new BackendException("Batch put failed", e);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    @Override
+    public void deleteBatch(List<K> keys) throws BackendException {
+        if (keys == null || keys.isEmpty()){
+            return;
+        }
+
+        lock.writeLock().lock();
+        try {
+            connection.setAutoCommit(false);
+
+            for (K key : keys) {
+                String keyHash = keyToHash(key);
+                deleteStmt.setString(1, keyHash);
+                deleteStmt.addBatch();
+            }
+
+            deleteStmt.executeBatch();
+            connection.commit();
+            connection.setAutoCommit(true);
+            LOGGER.info("Batch deleted {} entries", keys.size());
+        } catch (SQLException e) {
+            try {
+                connection.rollback();
+                connection.setAutoCommit(true);
+            } catch (SQLException rollbackEx) {
+                LOGGER.warn("Failed to rollback batch delete", rollbackEx);
+            }
+            throw new BackendException("Batch delete failed", e);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    // TODO generate stable hash for keys
     private String keyToHash(K key) {
         return key.toString();
     }
@@ -223,6 +319,7 @@ public class SQLiteBackend<K, V> implements Backend<K, V>{
         }
     }
 
+    // background cleanup task
     private void startCleanupTask() {
         Thread cleanupThread = new Thread(() -> {
             while (!Thread.currentThread().isInterrupted()) {
@@ -248,11 +345,11 @@ public class SQLiteBackend<K, V> implements Backend<K, V>{
                 stmt.setLong(1, now);
                 int deleted = stmt.executeUpdate();
                 if (deleted > 0) {
-                    LOGGER.fine("Cleaned up " + deleted + " expired entries from SQLite");
+                    LOGGER.info("Cleaned up {} expired entries from SQLite", deleted);
                 }
             }
         } catch (SQLException e) {
-            LOGGER.log(Level.WARNING, "Failed to cleanup expired entries", e);
+            LOGGER.warn( "Failed to cleanup expired entries", e);
         } finally {
             lock.writeLock().unlock();
         }

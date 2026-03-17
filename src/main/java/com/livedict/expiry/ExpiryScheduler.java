@@ -1,17 +1,17 @@
 package com.livedict.expiry;
 
 import com.livedict.core.LiveDictEntry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Map;
 import java.util.concurrent.*;
 import java.util.function.BiConsumer;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 public class ExpiryScheduler<K,V> {
 
     private static final Logger LOGGER =
-            Logger.getLogger(ExpiryScheduler.class.getName());
+            LoggerFactory.getLogger(ExpiryScheduler.class);
 
     private final ScheduledExecutorService scheduler;
 
@@ -47,7 +47,7 @@ public class ExpiryScheduler<K,V> {
         }
 
         scheduler.shutdown();
-        LOGGER.fine("LiveDict expiry reaper stopped.");
+        LOGGER.info("LiveDict expiry reaper stopped.");
     }
 
     private void reapExpiredEntries() {
@@ -64,7 +64,7 @@ public class ExpiryScheduler<K,V> {
                 }
             }
         } catch (Throwable t) {
-            LOGGER.log(Level.SEVERE, "Throwable caught during Livedict expiry reaping", t);
+            LOGGER.error("Throwable caught during Livedict expiry reaping", t);
         }
     }
 }

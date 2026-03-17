@@ -4,11 +4,27 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
+
+/**
+ * In-memory backend — no persistence, entries lost on JVM shutdown.
+ * <p>This is the default backend for LiveDict </p>
+ * It stores entries in a {@link ConcurrentHashMap} with no disk I/O.
+ * <p><b>Use cases: </b></p>
+ * <ul>
+ *      <li>High-performance caching where persistence is not needed</li>
+ *      <li>Temporary data (session tokens, rate limit counters)</li>
+ * </ul>
+ *
+ * <p><b>Thread safety: </b>Fully Thread-safe via {@code ConcurrentHashMap}</p>
+ *
+ * @param <K> the key type
+ * @param <V> the value type
+ */
 public class MemoryBackend<K,V> implements Backend<K, V> {
 
     private static class Entry<V> {
         final V value;
-        final long expiresAt;
+        final long expiresAt; // -1 if never expires
 
         Entry(V value, long expiresAt) {
             this.value = value;
@@ -33,7 +49,7 @@ public class MemoryBackend<K,V> implements Backend<K, V> {
             return null;
         }
 
-        if (entry.isExpired()){
+        if (entry.isExpired()){ // lazy removal
             store.remove(key);
             return null;
         }
@@ -45,6 +61,10 @@ public class MemoryBackend<K,V> implements Backend<K, V> {
     public void delete(K key) throws BackendException {
         store.remove(key);
     }
+
+    /**
+    * On initialization, load all non-expired entries
+     */
 
     @Override
     public Map<K, V> loadAll() throws BackendException {
@@ -64,6 +84,6 @@ public class MemoryBackend<K,V> implements Backend<K, V> {
 
     @Override
     public void close() throws BackendException {
-
+        // no-op
     }
 }

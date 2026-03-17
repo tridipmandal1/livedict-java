@@ -1,5 +1,6 @@
 package com.livedict.backend;
 
+import java.util.List;
 import java.util.Map;
 
 public interface Backend <K, V> {
@@ -16,5 +17,18 @@ public interface Backend <K, V> {
 
     void close() throws BackendException;
 
+    default void putBatch(List<PutEntry<K, V>> entries) throws BackendException{
+        for (PutEntry<K, V> entry : entries) {
+            put(entry.key, entry.value, entry.expiresAt);
+        }
+    }
 
+    default void deleteBatch(List<K> keys) throws BackendException{
+        for (K key : keys) {
+            delete(key);
+        }
+    }
+
+
+    record PutEntry<K, V>(K key, V value, long expiresAt) {}
 }
