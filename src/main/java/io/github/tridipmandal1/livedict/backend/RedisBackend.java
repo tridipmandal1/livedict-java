@@ -1,8 +1,9 @@
-package com.livedict.backend;
+package io.github.tridipmandal1.livedict.backend;
 
-import com.livedict.serialization.KryoSerializer;
-import com.livedict.serialization.SerializationException;
-import com.livedict.serialization.Serializer;
+
+import io.github.tridipmandal1.livedict.serialization.KryoSerializer;
+import io.github.tridipmandal1.livedict.serialization.SerializationException;
+import io.github.tridipmandal1.livedict.serialization.Serializer;
 import io.lettuce.core.*;
 import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.api.async.RedisAsyncCommands;
@@ -12,9 +13,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ExecutionException;
 
 /**
@@ -186,9 +185,9 @@ public class RedisBackend<K, V> implements Backend<K, V> {
     }
 
     @Override
-    public Map<K, V> loadAll() throws BackendException {
+    public List<LoadEntry<K, V>> loadAll() throws BackendException {
 
-        Map<K, V> result = new HashMap<>();
+        List<LoadEntry<K, V>> result = new ArrayList<>();
 
         try {
             // Get all keys from Redis with cursor pagination
@@ -206,7 +205,19 @@ public class RedisBackend<K, V> implements Backend<K, V> {
                         byte[] keyBytes = unprefixKey(redisKey);
                         K key = keySerializer.deserialize(keyBytes);
                         V value = valueSerializer.deserialize(valueBytes);
-                        result.put(key, value);
+                        // get ttl
+                        Long ttlMillis = sync.pttl(redisKey);
+                        long expiresAt;
+                        if (ttlMillis ==  null || ttlMillis == -1) {
+                            expiresAt = -1;
+                        } else if (ttlMillis == -2) {
+                            // Key doesn't exist (expired between GET and PTTL)
+                            continue;
+                        } else {
+                            // Convert TTL to absolute expiry timestamp
+                            expiresAt = System.currentTimeMillis() + ttlMillis;
+                        }
+                        result.add(new LoadEntry<>(key, value, expiresAt));
                     }
                 }
                 cursor = scanResult;

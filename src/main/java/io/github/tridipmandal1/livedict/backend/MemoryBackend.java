@@ -1,7 +1,7 @@
-package com.livedict.backend;
+package io.github.tridipmandal1.livedict.backend;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 
@@ -37,6 +37,7 @@ public class MemoryBackend<K,V> implements Backend<K, V> {
     }
 
     private final ConcurrentHashMap<K, Entry<V>> store = new ConcurrentHashMap<>();
+
     @Override
     public void put(K key, V value, long expiresAt) throws BackendException {
             store.put(key, new Entry<>(value, expiresAt));
@@ -67,11 +68,11 @@ public class MemoryBackend<K,V> implements Backend<K, V> {
      */
 
     @Override
-    public Map<K, V> loadAll() throws BackendException {
-        Map<K, V> result = new HashMap<>();
+    public List<LoadEntry<K, V>> loadAll() throws BackendException {
+        List<LoadEntry<K, V>> result = new ArrayList<>();
         store.forEach((key, entry) -> {
             if (!entry.isExpired()) {
-                result.put(key, entry.value);
+                result.add(new LoadEntry<>(key, entry.value, entry.expiresAt));
             }
         });
         return result;

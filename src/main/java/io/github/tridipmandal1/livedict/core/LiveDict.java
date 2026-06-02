@@ -1,14 +1,13 @@
-package com.livedict.core;
+package io.github.tridipmandal1.livedict.core;
 
-import com.livedict.backend.Backend;
-import com.livedict.backend.BackendException;
-import com.livedict.backend.PersistenceMode;
-import com.livedict.expiry.ExpiryScheduler;
-import com.livedict.reactivity.EventType;
-import com.livedict.reactivity.LiveDictEvent;
-import com.livedict.reactivity.LiveDictListener;
-import com.livedict.writebehind.WriteBehindExecutor;
-import com.livedict.writebehind.WriteOperation;
+import io.github.tridipmandal1.livedict.backend.*;
+import io.github.tridipmandal1.livedict.expiry.ExpiryScheduler;
+import io.github.tridipmandal1.livedict.backend.*;
+import io.github.tridipmandal1.livedict.reactivity.EventType;
+import io.github.tridipmandal1.livedict.reactivity.LiveDictEvent;
+import io.github.tridipmandal1.livedict.reactivity.LiveDictListener;
+import io.github.tridipmandal1.livedict.writebehind.WriteBehindExecutor;
+import io.github.tridipmandal1.livedict.writebehind.WriteOperation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -17,33 +16,120 @@ import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
 
 
+/**
+ * A generic, thread-safe, TTL-aware in-memory key-value store with lifecycle hooks.
+ *
+ * <p><b>Quick start:</b>
+ * <pre>{@code
+ *   LiveDict<String, String> cache = new LiveDict<>();
+ *
+ *   // Store with a 10-second TTL
+ *   cache.set("session:abc", "user-data", 10, TimeUnit.SECONDS);
+ *
+ *   // Retrieve (returns Optional to force callers to handle the "not found" case)
+ *   cache.get("session:abc").ifPresent(val -> System.out.println("Found: " + val));
+ *
+ *   // Register a callback for expiry events
+ *   cache.on(EventType.ON_EXPIRE, event ->
+ *       System.out.println("Expired: " + event.getKey()));
+ *
+ *   // Always close when done (stops the background reaper thread)
+ *   cache.close();
+ * }</pre>
+ *
+ * <p><b>Thread safety:</b> All public methods are safe to call from multiple
+ * threads simultaneously. The backing store is a {@link ConcurrentHashMap}.
+ * Listener registration uses {@link CopyOnWriteArrayList} — safe for concurrent
+ * reads with infrequent writes (listener lists are rarely modified after setup).
+ *
+ * <p><b>Why {@link Optional} for {@code get()}?</b>
+ * Unlike Python which just returns {@code None}, Java allows {@code null} values
+ * to be stored intentionally. Using {@code Optional<V>} makes the API unambiguous:
+ * an empty Optional always means "not found or expired", never "stored null".
+ *
+ * <p>Implements {@link AutoCloseable} so it can be used in try-with-resources:
+ * <pre>{@code
+ *   try (LiveDict<String, User> cache = new LiveDict<>()) {
+ *       // use cache ...
+ *   } // cache.close() called automatically — no thread leak
+ * }</pre>
+ *
+ * @param <K> the type of keys — should have a good {@code hashCode()} and {@code equals()}
+ * @param <V> the type of stored values
+ */
 public class LiveDict<K, V> implements AutoCloseable{
 
     private static final Logger LOGGER =
             LoggerFactory.getLogger(LiveDict.class);
 
+    /** The backing store. Keys map to wrapped entries (value + TTL metadata). */
     private final ConcurrentHashMap<K, LiveDictEntry<V>> store;
 
+    /** The configuration for this instance (TTL defaults, cleanup interval). */
     private final LiveDictConfig config;
 
+    /**
+     * Per-event-type listener lists.
+     * <br>
+     * CopyOnWriteArrayList: reads (which happen on every set/get/expire) are
+     * lock-free. Writes (listener registration) copy the underlying array.
+     * This is the right trade-off since listeners are registered once at
+     * startup but fired thousands of times per second.
+     */
     private final Map<EventType, CopyOnWriteArrayList<LiveDictListener<K,V>>> listeners;
 
+    /** Manages the background expiry reaper thread. */
     private final ExpiryScheduler<K,V> expiryScheduler;
 
+    /**
+     * Executor for async listener dispatch (only created when config.asyncListeners = true).
+     * When null, listeners run synchronously on the calling thread.
+     */
     private final ExecutorService listenerExecutor;
 
+    /**
+     * Per-key locks for explicit lock/unlock API.
+     *
+     * <p>Locks are created on-demand when first requested for a key.
+     * They are never removed (small memory leak for keys that get locked
+     * at least once), but this simplifies concurrency significantly.
+     *
+     * <p>Note: These locks are SEPARATE from the thread-safety of get/set/delete,
+     * which are already safe via ConcurrentHashMap. These are for user-level
+     * atomic multi-operation sequences like read-modify-write.
+     */
     private final ConcurrentHashMap<K, ReentrantLock> keyLocks;
 
+    /**
+     * Persistence backend for durable storage.
+     *
+     * <p>Default is {@link MemoryBackend}, which provides no persistence.
+     * Can be configured to use {@link SQLiteBackend} for local file
+     * persistence, or RedisBackend {@link RedisBackend} for distributed persistence.
+     */
     private final Backend<K, V> backend;
 
+    /**
+     * Write-behind executor for async batched writes.
+     * Only created when persistenceMode = WRITE_BEHIND.
+     * When null, writes go directly to backend (write-through mode).
+     */
     private final WriteBehindExecutor<K, V> writeBehindExecutor;
 
+    /**
+     * Executor for async API methods (getAsync, setAsync, etc.).
+     * Shared thread pool for all async operations.
+     * Only created when async API is actually used (lazy initialization).
+     *
+     */
     private final ExecutorService asyncExecutor;
 
+    /** Creates a LiveDict with default configuration. */
     public LiveDict (){
         this(LiveDictConfig.defaults());
     }
 
+    /** Creates a LiveDict with the given configuration. */
     public LiveDict(LiveDictConfig config) {
         this.config = config;
         this.store = new ConcurrentHashMap<>();
@@ -51,10 +137,12 @@ public class LiveDict<K, V> implements AutoCloseable{
         this.keyLocks = new ConcurrentHashMap<>();
         this.backend = config.getBackend();
 
+        // Pre-populate listener lists for all event types to avoid null checks later
         for(EventType type: EventType.values()) {
             listeners.put(type, new CopyOnWriteArrayList<>());
         }
 
+        // Create an async listener executor if enabled
         if (config.isAsyncListeners()) {
             this.listenerExecutor = Executors.newFixedThreadPool(
                     config.getListenerThreads(),
@@ -81,18 +169,20 @@ public class LiveDict<K, V> implements AutoCloseable{
                 );
         // sync the memory store with the backend
         try {
-            Map<K, V> existing = backend.loadAll();
+
+            List<Backend.LoadEntry<K, V>> existing = backend.loadAll();
             if (!existing.isEmpty()) {
-                // TODO: Backend not returning ttl information
-                for (Map.Entry<K, V> entry : existing.entrySet()) {
-                    store.put(entry.getKey(), new LiveDictEntry<>(entry.getValue(), -1));
+                for (Backend.LoadEntry<K, V> entry: existing) {
+                    store.put(entry.key(), new LiveDictEntry<>(entry.value(), entry.expiresAt()));
                 }
                 LOGGER.info("Loaded {} entries from backend", existing.size());
             }
         } catch (BackendException e) {
             LOGGER.error("Failed to load existing entries from backend - starting with empty cache", e);
+            // Continue with an empty cache rather than failing
         }
 
+        // Create a write-behind executor if enabled
         if (config.getPersistenceMode() == PersistenceMode.WRITE_BEHIND) {
             this.writeBehindExecutor =
                     new WriteBehindExecutor<>(
@@ -108,6 +198,8 @@ public class LiveDict<K, V> implements AutoCloseable{
             LOGGER.info("Write-through mode enabled");
         }
 
+        // Wire up the expiry scheduler — it gets a reference to the store and a
+        // callback to invoke when it reaps an entry.
         this.expiryScheduler = new ExpiryScheduler<>(store, this::handleExpiredEntry);
         this.expiryScheduler.start(config.getCleanupIntervalMillis());
     }
@@ -160,7 +252,7 @@ public class LiveDict<K, V> implements AutoCloseable{
                     new WriteOperation.Put<>(key, value, expiresAt)
             );
             if (!enqueued) {
-                // memory updated but backend write rejected
+                // memory updated, but backend write rejected
                 // Reject&Log strategy
                 LOGGER.warn("Write-behind queue full — write may be lost for key: {}", key);
             }
@@ -185,12 +277,12 @@ public class LiveDict<K, V> implements AutoCloseable{
      * Retrieves the value for the given key.
      *
      * <p>Performs a <b>lazy expiry check</b>: if the entry exists but has
-     * passed its TTL, it is removed and an empty Optional is returned.
+     * passed its TTL, it is removed, and an empty Optional is returned.
      * This guarantees callers never receive stale values, even if the
      * background reaper hasn't run yet.
      *
      * @param key the key to look up
-     * @return an Optional containing the value, or empty if not found / expired
+     * @return an Optional containing the value or empty if not found / expired
      */
     public Optional<V> get(K key) {
         if (key == null) return Optional.empty();
@@ -200,7 +292,7 @@ public class LiveDict<K, V> implements AutoCloseable{
         if (entry == null) return Optional.empty();
 
         if (entry.isExpired()) {
-            removeEntry(key, entry, EventType.ON_EXPIRE);
+            removeEntry(key, entry);
             return Optional.empty();
         }
 
@@ -416,7 +508,7 @@ public class LiveDict<K, V> implements AutoCloseable{
      * Registers a listener for the given event type.
      *
      * <p>Multiple listeners can be registered for the same event type.
-     * They are invoked in registration order.
+     * They are invoked in a registration order.
      *
      * <pre>{@code
      *   cache.on(EventType.ON_EXPIRE, event ->
@@ -492,18 +584,10 @@ public class LiveDict<K, V> implements AutoCloseable{
         }
     }
 
-    /**
-     * Convenience method for expiry events, called by both the lazy-expiry
-     * path in {@link #get} and the eager-expiry path in {@link ExpiryScheduler}.
-     */
-    @Deprecated
-    private void fireExpireEvent(K key, V value){
-        fireEvent(EventType.ON_EXPIRE, key, value);
-    }
 
     /**
      * Callback invoked by ExpiryScheduler when it reaps an expired entry.
-     * Deletes from backend and fires ON_EXPIRE event.
+     * Deletes from the backend and fires ON_EXPIRE event.
      */
     private void handleExpiredEntry(K key, V value) {
 
@@ -527,7 +611,7 @@ public class LiveDict<K, V> implements AutoCloseable{
      * <p>Used by {@code get()} for lazy expiry, and by {@code ExpiryScheduler}
      * for eager expiry.
      */
-    private void removeEntry(K key, LiveDictEntry<V> entry, EventType eventType) {
+    private void removeEntry(K key, LiveDictEntry<V> entry) {
 
         boolean removed = store.remove(key, entry);
 
@@ -544,7 +628,7 @@ public class LiveDict<K, V> implements AutoCloseable{
                 }
             }
         }
-        fireEvent(eventType, key, entry.getValue());
+        fireEvent(EventType.ON_EXPIRE, key, entry.getValue());
     }
 
     // per-key locking apis

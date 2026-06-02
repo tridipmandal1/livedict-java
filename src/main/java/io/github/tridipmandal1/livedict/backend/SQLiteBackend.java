@@ -1,13 +1,13 @@
-package com.livedict.backend;
+package io.github.tridipmandal1.livedict.backend;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
+import java.security.MessageDigest;
 import java.sql.*;
-import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 
@@ -160,11 +160,11 @@ public class SQLiteBackend<K, V> implements Backend<K, V>{
     }
 
     @Override
-    public Map<K, V> loadAll() throws BackendException {
+    public List<LoadEntry<K, V>> loadAll() throws BackendException {
 
         lock.readLock().lock();
         try {
-            Map<K, V> result = new HashMap<>();
+            List<LoadEntry<K, V>> result = new ArrayList<>();
             String query = "SELECT key_bytes, value_bytes, expires_at FROM livedict_entries";
 
             try (Statement stmt = connection.createStatement();
@@ -174,7 +174,7 @@ public class SQLiteBackend<K, V> implements Backend<K, V>{
                 while (rs.next()) {
                     long expiresAt = rs.getLong("expires_at");
                     if (expiresAt != -1 && now > expiresAt) {
-                        continue;
+                        continue; // skip expired entries
                     }
 
                     byte[] keyBytes = rs.getBytes("key_bytes");
@@ -182,7 +182,7 @@ public class SQLiteBackend<K, V> implements Backend<K, V>{
 
                     K key = deserialize(keyBytes);
                     V value = deserialize(valueBytes);
-                    result.put(key, value);
+                    result.add(new LoadEntry<>(key, value, expiresAt));
                 }
             }
             return result;
@@ -298,9 +298,37 @@ public class SQLiteBackend<K, V> implements Backend<K, V>{
         }
     }
 
-    // TODO generate stable hash for keys
+    // Serialization helpers
+
+    /**
+     * Generates a stable, collision-resistant hash for a key.
+     *
+     * <p>Uses SHA-256 hash of the serialized key bytes to ensure:
+     * <ul>
+     *   <li>Stability across JVM restarts</li>
+     *   <li>Collision resistance (2^128 probability)</li>
+     *   <li>No dependency on toString() implementation</li>
+     * </ul>
+     *
+     * <p>The hash is encoded as hexadecimal string for SQLite TEXT storage.
+     */
     private String keyToHash(K key) {
-        return key.toString();
+        try {
+            byte [] keyBytes = serialize(key);
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+
+            byte[] hashedBytes = md.digest(keyBytes);
+
+            // covert to hex string
+            StringBuilder hex = new StringBuilder(hashedBytes.length * 2);
+            for (byte b: hashedBytes) {
+                hex.append(String.format("%02x", b));
+            }
+            return hex.toString();
+        } catch (Exception e) {
+            // Fallback to object hash if serialization fails
+            return String.valueOf(System.identityHashCode(key));
+        }
     }
 
     private byte[] serialize(Object obj) throws IOException {

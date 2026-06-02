@@ -1,4 +1,4 @@
-package com.livedict.backend;
+package io.github.tridipmandal1.livedict.backend;
 
 public enum PersistenceMode {
 

@@ -1,4 +1,4 @@
-package com.livedict.serialization;
+package io.github.tridipmandal1.livedict.serialization;
 
 import com.esotericsoftware.kryo.Kryo;
 import com.esotericsoftware.kryo.io.Input;
